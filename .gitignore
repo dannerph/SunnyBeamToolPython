@@ -1,0 +1,8 @@
+.idea/*
+.vscode/*
+build/
+dist/
+sunnybeamtool.egg-info/
+venv/
+
+__pycache__

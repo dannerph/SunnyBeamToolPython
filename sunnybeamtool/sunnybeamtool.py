@@ -242,22 +242,3 @@ class SunnyBeam:
         # always read dummy data
         self.__read_raw_message(5)
         return True
-
-
-if __name__ == "__main__":
-
-    logging.basicConfig()
-    logging.getLogger().setLevel(logging.WARNING)
-
-    s_beam = SunnyBeam()
-
-    while True:
-        data = s_beam.get_measurements()
-        print(data)
-        time.sleep(10)
-
-    # data = s_beam.get_today_measurements()
-    # print(data)
-
-    # data = s_beam.get_last_month_measurements()
-    # print(data)
