@@ -5,7 +5,7 @@ with open("README.md", "r") as fh:
 
 setup(
     name='sunnybeamtool',
-    version='0.0.2',    
+    version='0.1.0',    
     description='SMA Sunny Beam Tool',
     url='https://github.com/dannerph/SunnyBeamToolPython',
     author='Philipp Danner',

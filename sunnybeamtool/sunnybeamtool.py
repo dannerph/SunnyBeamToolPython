@@ -1,4 +1,4 @@
-from usb import core, util, control
+from usb import core, util
 import crcmod
 import logging
 import asyncio
