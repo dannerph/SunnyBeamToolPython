@@ -1,4 +1,4 @@
-from usb import core
+from usb import core, util, control
 import crcmod
 import logging
 import asyncio
@@ -13,6 +13,8 @@ class SunnyBeam:
         self.__CRCFUN = crcmod.predefined.mkCrcFun('x-25')
         self.__connected = False
 
+    async def connect(self):
+
         # find SMA device
         dev = core.find(idVendor=0x1587, idProduct=0x002D)
         if dev is None:
@@ -26,15 +28,18 @@ class SunnyBeam:
             _LOGGER.info("Device Manufacturer: " + self.__dev.manufacturer)
             _LOGGER.info("Serial Number: " + self.__dev.serial_number)
 
+            util.claim_interface(self.__dev, 0)
+            
+             # First do a SET_FEATURE config
+            if dev.ctrl_transfer(bmRequestType=0x40, bRequest=0x03, wIndex=0x0000, wValue=0x4138) == 0:
 
-    async def connect(self):
-        # Fetching device ID
-        self.__device_id = await self.__search_device_id()
-        if self.__device_id == None:
-            _LOGGER.error("Could not fetch device ID. Further request will not work")
-        else:
-            _LOGGER.debug("device id= " + hex(self.__device_id[1]).lstrip("0x") + hex(self.__device_id[0]).lstrip("0x"))
-            self.__connected = True
+                # Fetching device ID
+                self.__device_id = await self.__search_device_id()
+                if self.__device_id == None:
+                    _LOGGER.error("Could not fetch device ID. Further request will not work")
+                else:
+                    _LOGGER.debug("device id= " + hex(self.__device_id[1]).lstrip("0x") + hex(self.__device_id[0]).lstrip("0x"))
+                    self.__connected = True
 
 
     async def get_measurements(self):
