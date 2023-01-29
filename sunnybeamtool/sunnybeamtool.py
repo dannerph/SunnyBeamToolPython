@@ -156,7 +156,19 @@ class SunnyBeam:
         
         # Add CRC
         crc = self.__CRCFUN(msg_for_crc)
-        msg[-3:-1] = bytearray(crc.to_bytes(length=2, byteorder='little'))
+        checksum = bytearray(crc.to_bytes(length=2, byteorder='little'))
+        newcrc = bytearray()
+        for value in checksum:
+            if value == 0x7e:
+                newcrc.append(0x7d) 
+                newcrc.append(0x5e) 
+            elif value == 0x7d:
+                newcrc.append(0x7d) 
+                newcrc.append(0x5d) 
+            else:
+                newcrc.append(value) 
+        msg[-3:-1] = newcrc
+
         _LOGGER.debug("Sent: " + msg.hex())
         
         await asyncio.sleep(0.2)
