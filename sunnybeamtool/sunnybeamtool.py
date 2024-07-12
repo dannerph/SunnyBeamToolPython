@@ -1,182 +1,296 @@
-from usb import core, util
-import crcmod
-import logging
+"""Sunnybeam main class"""
+
 import asyncio
+import logging
 import struct
 from datetime import datetime
 
+import crcmod
+from usb import core, util
+
 _LOGGER = logging.getLogger(__name__)
 
+from .const import (
+    BASIC_MSG,
+    GET_LAST_MONTH_CMD,
+    GET_MEASUREMENTS_CMD,
+    GET_TODAY_CMD,
+    NEXT_MSG_CMD,
+    SYN_ONLINE_CMD,
+)
+
+
 class SunnyBeam:
+    """Sunny Beam connection"""
 
     def __init__(self):
-        self.__CRCFUN = crcmod.predefined.mkCrcFun('x-25')
-        self.__connected = False
+        self._crc_function = crcmod.predefined.mkCrcFun("x-25")
+        self._dev = None
+        self._device_id: bytearray | None = None
+        self._connected = False
 
-    async def connect(self):
+    async def get_product(self) -> str:
+        """Get device serial number
 
-        # find SMA device
+        Returns:
+            str: serial number as string
+        """
+        await self._connect()
+        return self._dev.product
+
+    async def get_manufacturer(self) -> str:
+        """Get device serial number
+
+        Returns:
+            str: serial number as string
+        """
+        await self._connect()
+        return self._dev.manufacturer
+
+    async def get_serial_number(self) -> str:
+        """Get device serial number
+
+        Returns:
+            str: serial number as string
+        """
+        await self._connect()
+        return self._dev.serial_number
+
+    async def get_measurements(self) -> dict[str, any]:
+        """Get measurements from the Sunny Beam device
+
+        Raises:
+            ConnectionError: raised if connection is not available or device does not respond
+
+        Returns:
+            dict[str, any]: Returns power, energy_today and energy_total measurements in a dict
+        """
+        await self._connect()
+        try:
+            await self._send_raw_message(GET_MEASUREMENTS_CMD, True)
+
+            buf = await self._read_raw_message(50)
+            if len(buf) <= 0:
+                raise ConnectionError("Device does not respond")
+
+            power = int(struct.unpack("f", buf[25:29])[0])
+            energy_today = round(struct.unpack("f", buf[29:33])[0], 3)
+            energy_total = round(struct.unpack("f", buf[33:37])[0], 3)
+
+            _LOGGER.debug("pac: %d W", power)
+            _LOGGER.debug("e-today: %f kWh", energy_today)
+            _LOGGER.debug("e-total: %f kWh", energy_total)
+            return {
+                "power": round(power / 1000.0, 3),
+                "energy_today": energy_today,
+                "energy_total": energy_total,
+            }
+        except ConnectionError as err:
+            self._connected = False
+            raise err
+
+    async def get_today_measurements(self) -> list[tuple[datetime, float]] | None:
+        """Get power values of today as list including datetimes
+
+        Returns:
+            list[tuple[datetime, float]] | None: power values from today
+        """
+        await self._connect()
+        try:
+            data = await self._do_combined_read_messages(GET_TODAY_CMD)
+            return self._parse_measurements(rawdata=data)
+        except ConnectionError as err:
+            self._connected = False
+            raise err
+
+    async def get_last_month_measurements(self) -> list[tuple[datetime, float]] | None:
+        """Get energy values from last month including datetimes
+
+        Returns:
+            list[tuple[datetime, float]] | None: energy values from last month
+        """
+        await self._connect()
+        try:
+            data = await self._do_combined_read_messages(GET_LAST_MONTH_CMD)
+            return self._parse_measurements(rawdata=data)
+        except ConnectionError as err:
+            self._connected = False
+            raise err
+
+    async def _connect(self) -> None:
+        """Try to connect to Sunny Beam USB device
+
+        Raises:
+            ConnectionError: raised if connection is not available or device does not respond
+        """
+
+        if self._connected:
+            return  # Already connected
+
+        # Find SMA device
         dev = core.find(idVendor=0x1587, idProduct=0x002D)
         if dev is None:
-            _LOGGER.critical('Sunny Beam not found.')
-        else:
-            # Reset device and activate first available configuration
-            dev.reset()
-            dev.set_configuration()
-            self.__dev = dev
+            raise ConnectionError("Sunny Beam not found")
 
-            _LOGGER.info("Device Manufacturer: " + self.__dev.manufacturer)
-            _LOGGER.info("Serial Number: " + self.__dev.serial_number)
+        # Reset device and activate first available configuration
+        dev.reset()
+        dev.set_configuration()
+        self._dev = dev
+        _LOGGER.info(
+            "Connected to %s from %s with serial number %s",
+            self._dev.product,
+            self._dev.manufacturer,
+            self._dev.serial_number,
+        )
+        util.claim_interface(self._dev, 0)
 
-            util.claim_interface(self.__dev, 0)
-            
-             # First do a SET_FEATURE config
-            if dev.ctrl_transfer(bmRequestType=0x40, bRequest=0x03, wIndex=0x0000, wValue=0x4138) == 0:
+        response = self._dev.ctrl_transfer(
+            bmRequestType=0x40, bRequest=0x03, wIndex=0x0000, wValue=0x4138
+        )
+        if response != 0:
+            raise ConnectionError("Could not set required features to device")
 
-                # Fetching device ID
-                self.__device_id = await self.__search_device_id()
-                if self.__device_id == None:
-                    _LOGGER.error("Could not fetch device ID. Further request will not work")
-                else:
-                    _LOGGER.debug("device id= " + hex(self.__device_id[1]).lstrip("0x") + hex(self.__device_id[0]).lstrip("0x"))
-                    self.__connected = True
+        # First do a SET_FEATURE config
+        try:
+            response = self._dev.ctrl_transfer(
+                bmRequestType=0x40, bRequest=0x03, wIndex=0x0000, wValue=0x4138
+            )
+        except core.USBError as err:
+            raise ConnectionError("Could not set required features to device") from err
 
+        # Fetching device ID
+        if self._device_id is None:
+            self._device_id = await self._search_device_id()
+            _LOGGER.debug(
+                "device id= "
+                + hex(self._device_id[1]).lstrip("0x")
+                + hex(self._device_id[0]).lstrip("0x")
+            )
+        self._connected = True
 
-    async def get_measurements(self):
+    async def _do_combined_read_messages(self, input_msg: bytearray) -> bytearray:
+        await self._do_syn_online()
 
-        if not self.__connected or not await self.__do_syn_online():
-            _LOGGER.error("Sunny Beam not available.")
-            return 0
-
-        cmd_get_data = bytearray([0x7e, 0xff, 0x03, 0x40, 0x41, 0x00, 0x00, 0x00, 0x00, 0x10, 0x00, 0x0b, 0x0f, 0x09, 0x00, 0x00, 0x00, 0x7e])
-        resu = await self.__send_raw_message(cmd_get_data, True)
-        if resu > 0:
-            buf = await self.__read_raw_message(50)
-            if len(buf) <= 0:
-                return 0
-
-            pac = int(struct.unpack('f', buf[25:29])[0])
-            etoday = round(struct.unpack('f', buf[29:33])[0], 3)
-            etotal = round(struct.unpack('f', buf[33:37])[0], 3)
-            
-            _LOGGER.info("pac: " + str(pac) + " W")
-            _LOGGER.info("e-today: " + str(etoday) + " kWh")
-            _LOGGER.info("e-total: " + str(etotal) + " kWh")
-
-        return (pac, etoday, etotal)
-
-    async def get_today_measurements(self):
-
-        if not self.__connected:
-            _LOGGER.error("Sunny Beam not available.")
-            return 0
-
-        cmd_get_data = bytearray([0x7e, 0xff, 0x03, 0x40, 0x41, 0x00, 0x00, 0x00, 0x00, 0x10, 0x00, 0x0b, 0x04, 0x19, 0x01, 0xd1, 0x4c, 0x20, 0x4a, 0xff, 0xff, 0xff, 0x7f, 0x00, 0x00, 0x7e])
-
-        data = await self.__do_combined_read_messages(cmd_get_data)
-        return self.__parse_measurements(rawdata=data)
-
-
-    async def get_last_month_measurements(self):
-
-        if not self.__connected:
-            _LOGGER.error("Sunny Beam not available.")
-            return 0
-
-        cmd_get_data = bytearray([0x7e, 0xff, 0x03, 0x40, 0x41, 0x00, 0x00, 0xd4, 0xf5, 0x10, 0x00, 0x0b, 0x04, 0x7d, 0x31, 0x02, 0x7f, 0x25, 0x1f, 0x4a, 0xff, 0xff, 0xff, 0x7f, 0x00, 0x00, 0x7e])
-
-        data = await self.__do_combined_read_messages(cmd_get_data)
-        return self.__parse_measurements(rawdata=data)
-
-
-    async def __do_combined_read_messages(self, input_msg):
-        if not await self.__do_syn_online():
-            return 0
-        
         # first message
-        if await self.__send_raw_message(input_msg, True) == 0:
-            return 0
-        
+        await self._send_raw_message(input_msg, True)
+
         buf_out = bytearray()
-        min = 20
+        minimum = 20
         linecnt = 0xFF
-        while (linecnt != 0):
-            min -= 1
-            if (min == 0):
+        while linecnt != 0:
+            minimum -= 1
+            if minimum == 0:
                 break
-            if (linecnt != 0xFF):
+            if linecnt != 0xFF:
                 # ask next messages
-                cmd_get_data = bytearray([0x7e, 0xff, 0x03, 0x40, 0x41, 0x00, 0x00, 0x00, 0x00, 0x10, linecnt, 0x0b, 0x00, 0x00, 0x7e])
-                resu = await self.__send_raw_message(cmd_get_data, True)
-                if resu == 0:
-                    return 0
-            tmpbuf = await self.__read_raw_message(50)
+                NEXT_MSG_CMD[10] = linecnt
+                await self._send_raw_message(NEXT_MSG_CMD, True)
+            tmpbuf = await self._read_raw_message(50)
             if len(tmpbuf) <= 0:
                 return buf_out
+
             if len(tmpbuf) > 12:
-                buf_out.extend(tmpbuf[12:-3]) # remove first 12 bytes and last 3 bytes (CRC + 7e
-            
+                # remove first 12 bytes and last 3 bytes (CRC + 7e)
+                buf_out.extend(tmpbuf[12:-3])
             linecnt = tmpbuf[10]
 
-        _LOGGER.debug("Read multiple msgs: " + buf_out.hex())
+        _LOGGER.debug("Read multiple msgs: %s", buf_out.hex())
         return buf_out
 
+    def _parse_measurements(
+        self, rawdata: bytearray | None
+    ) -> list[tuple[datetime, float]] | None:
+        """Parse list measurements
 
-    def __parse_measurements(self, rawdata):
-        if len(rawdata) <= 0:
-            return 0
+        Args:
+            rawdata (bytearray | None): raw data list
+
+        Returns:
+            list[tuple[datetime, float]] | None: output list of data after parsing datetime extracting the values. None if error in parsing
+        """
+
+        if rawdata is None or len(rawdata) <= 0:
+            return None
 
         data = []
-        for i in range(5,len(rawdata), 12):
-            part_buf = rawdata[i:i+12]
-            _LOGGER.debug("day: " + part_buf.hex())
+        for i in range(5, len(rawdata), 12):
+            part_buf = rawdata[i : i + 12]
+            _LOGGER.debug("day: %s", part_buf.hex())
 
-            val = round(struct.unpack('f', part_buf[8:])[0], 0)
-            timestamp = struct.unpack('i', part_buf[0:4])[0]
-            time = datetime.utcfromtimestamp(timestamp)
+            if len(part_buf) != 12:
+                return None
+            val = round(struct.unpack("f", part_buf[8:])[0], 0)
+            timestamp = struct.unpack("i", part_buf[0:4])[0]
+            time = datetime.fromtimestamp(timestamp)
             data.append((time, val))
 
         return list(reversed(data))
 
+    async def _send_raw_message(self, msg: bytearray, set_device_id: bool) -> int:
+        """Sends a raw message and returns the number of bytes written
 
-    async def __send_raw_message(self, msg: bytearray, set_deviceid: bool):
-        if set_deviceid:
-            msg[7:9] = self.__device_id
+        Args:
+            msg (bytearray): _description_
+            set_device_id (bool): _description_
+
+        Raises:
+            ConnectionError: raised if connection is not available or device does not respond
+
+        Returns:
+            int: Number of bytes written
+        """
+        if set_device_id:
+            msg[7:9] = self._device_id
 
         msg_for_crc = bytearray()
         escape_next = False
         for b in msg[1:-3]:
-            if b == 0x7d:
+            if b == 0x7D:
                 escape_next = True
             else:
                 if escape_next:
                     b ^= 0x20
                     escape_next = False
                 msg_for_crc.append(b)
-        
-        # Add CRC
-        crc = self.__CRCFUN(msg_for_crc)
-        checksum = bytearray(crc.to_bytes(length=2, byteorder='little'))
-        newcrc = bytearray()
-        for value in checksum:
-            if value == 0x7e:
-                newcrc.append(0x7d) 
-                newcrc.append(0x5e) 
-            elif value == 0x7d:
-                newcrc.append(0x7d) 
-                newcrc.append(0x5d) 
-            else:
-                newcrc.append(value) 
-        msg[-3:-1] = newcrc
 
-        _LOGGER.debug("Sent: " + msg.hex())
-        
+        # Add CRC
+        crc = self._crc_function(msg_for_crc)
+        checksum = bytearray(crc.to_bytes(length=2, byteorder="little"))
+        new_crc = bytearray()
+        for value in checksum:
+            if value == 0x7E:
+                new_crc.append(0x7D)
+                new_crc.append(0x5E)
+            elif value == 0x7D:
+                new_crc.append(0x7D)
+                new_crc.append(0x5D)
+            else:
+                new_crc.append(value)
+        msg[-3:-1] = new_crc
+
+        _LOGGER.debug("Sent: %s", msg.hex())
         await asyncio.sleep(0.2)
 
-        return self.__dev.write(endpoint=0x02, data=msg, timeout=1000)
+        try:
+            nr_sent_bytes = self._dev.write(endpoint=0x02, data=msg, timeout=1000)
+        except core.USBError as err:
+            raise ConnectionError("Device not available") from err
+        if nr_sent_bytes <= 0:
+            raise ConnectionError("Could not send raw message to device")
+        return nr_sent_bytes
 
+    async def _read_raw_message(
+        self, max_iterations: int, buffer_size: int = 1024
+    ) -> bytearray:
+        """Read raw message from device
 
-    async def __read_raw_message(self, max_iterations: int, buffer_size: int=1024):
+        Args:
+            max_iterations (int): number of iterations to wait for a response (each 70ms)
+            buffer_size (int, optional): buffer size. Defaults to 1024.
+
+        Returns:
+            bytearray: raw response message
+        """
         buf_out = bytearray()
         # reading can spawn multiple 'usb_bulk_read operations
         # always ignore the first two raw bytes and seek for "0x7e...0x7e sequence
@@ -187,81 +301,94 @@ class SunnyBeam:
 
         for _ in range(max_iterations):
             await asyncio.sleep(0.07)
-
-            buf_in = bytearray(self.__dev.read(0x81, buffer_size, 1000).tobytes())
-            _LOGGER.debug("raw_read: " + buf_in.hex())
+            try:
+                raw_response = self._dev.read(0x81, buffer_size, 1000)
+            except core.USBError as err:
+                raise ConnectionError("Could not read form device") from err
+            buf_in = bytearray(raw_response.tobytes())
+            _LOGGER.debug("raw_read: %s", buf_in.hex())
 
             # Process payload if available
-            if len(buf_in) > 2 :
+            if len(buf_in) > 2:
                 end_found = False
 
                 for p in range(2, len(buf_in)):
-                    myByte = buf_in[p]
+                    my_byte = buf_in[p]
 
-                    if myByte == 0x7e:
+                    if my_byte == 0x7E:
                         if not start_found:
                             start_found = True
                         else:
                             end_found = True
 
                     # long communications get a 0x01 0x60 in between. not sure why...
-                    if (start_found and (myByte == 0x60) and (buf_in[p - 1] == 0x01)):
+                    if start_found and (my_byte == 0x60) and (buf_in[p - 1] == 0x01):
                         del buf_out[-1]
                         continue
 
-                    if myByte == 0x7d:
+                    if my_byte == 0x7D:
                         previous_char_is_escape = True
                         continue
 
                     if previous_char_is_escape:
-                        if myByte == 0x5e:
-                            myByte = 0x7e # not end!
-                        elif myByte == 0x5d:
-                            myByte = 0x7d # not and escape char!
+                        if my_byte == 0x5E:
+                            my_byte = 0x7E  # not end!
+                        elif my_byte == 0x5D:
+                            my_byte = 0x7D  # not and escape char!
                         else:
-                            myByte ^= 0x20
+                            my_byte ^= 0x20
                         previous_char_is_escape = False
 
-                    buf_out.append(myByte)
+                    buf_out.append(my_byte)
                     if end_found:
-                        break #stop payload processing
+                        break  # stop payload processing
 
                 if end_found:
-                    break # stop iterations
+                    break  # stop iterations
 
-        _LOGGER.debug("raw_read processed: " + buf_out.hex())
-            
+        _LOGGER.debug("raw_read processed: %s", buf_out.hex())
+
         # Check CRC
         if len(buf_out) > 2:
-            crc = bytearray(self.__CRCFUN(buf_out[1:-3]).to_bytes(length=2, byteorder='little'))
-            returned_crc = buf_out[-3:-1]
-            if crc != returned_crc:
-                _LOGGER.warning("read bad crc " + returned_crc.hex() + ", should be " + crc.hex() + ". Message *should* be rejected.")
+            crc = bytearray(
+                self._crc_function(buf_out[1:-3]).to_bytes(length=2, byteorder="little")
+            )
+            msg_crc = buf_out[-3:-1]
+            if crc != msg_crc:
+                _LOGGER.warning(
+                    "Read bad crc %s, should be %s. Message *should* be rejected",
+                    msg_crc.hex(),
+                    crc.hex(),
+                )
         return buf_out
 
+    async def _search_device_id(self) -> bytearray:
+        """Try to find Sunny Beam device id
 
-    async def __search_device_id(self):
-        basic_msg = bytearray([0x7e, 0xFF, 0x03, 0x40, 0x41, 0x00, 0x00, 0x00, 0x00, 0x90, 0x00, 0x02, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x7e])
+        Raises:
+            ConnectionError: raised if connection is not available or device does not respond
+
+        Returns:
+            bytearray: device id as bytearray or None if not found
+        """
 
         # Integrate serial number in request
-        serial_number_prepared = int(self.__dev.serial_number) + 140000000
-        basic_msg[12:16] = bytearray(serial_number_prepared.to_bytes(length=4, byteorder='little'))
+        serial_number_prepared = int(self._dev.serial_number) + 140000000
+        BASIC_MSG[12:16] = bytearray(
+            serial_number_prepared.to_bytes(length=4, byteorder="little")
+        )
 
-        resu = await self.__send_raw_message(basic_msg, False)
-        if resu > 0:
-            data = await self.__read_raw_message(20)
-            if len(data) < 7:
-                return None
-            else:
-                return data[5:7]
-        return None
+        await self._send_raw_message(BASIC_MSG, False)
+        data = await self._read_raw_message(20)
+        if len(data) < 7:
+            raise ConnectionError("Device does not respond")
+        return data[5:7]
 
+    async def _do_syn_online(self):
+        """Check if device is still online, if not ConnectionError is raised
 
-    async def __do_syn_online(self):
-        cmd_syn_online = bytearray([0x7e, 0xff, 0x03, 0x40, 0x41, 0x00, 0x00, 0x00, 0x00, 0x80, 0x00, 0x0a, 0x00, 0x00, 0x00, 0x00, 0x2d, 0x2e, 0x7e])
-        resu = await self.__send_raw_message(cmd_syn_online, False)
-        if resu == 0:
-            return False
-        # always read dummy data
-        await self.__read_raw_message(5)
-        return True
+        Raises:
+            ConnectionError: raised if connection is not available or device does not respond
+        """
+        await self._send_raw_message(SYN_ONLINE_CMD, False)
+        await self._read_raw_message(5)  # always read dummy data
