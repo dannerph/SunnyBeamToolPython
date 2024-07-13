@@ -128,13 +128,16 @@ class SunnyBeam:
             return  # Already connected
 
         # Find SMA device
-        dev = core.find(idVendor=0x1587, idProduct=0x002D)
+        loop = asyncio.get_event_loop()
+        dev = await loop.run_in_executor(
+            None, lambda: core.find(idVendor=0x1587, idProduct=0x002D)
+        )
         if dev is None:
             raise ConnectionError("Sunny Beam not found")
 
         # Reset device and activate first available configuration
-        dev.reset()
-        dev.set_configuration()
+        await loop.run_in_executor(None, dev.reset)
+        await loop.run_in_executor(None, dev.set_configuration)
         self._dev = dev
         _LOGGER.info(
             "Connected to %s from %s with serial number %s",
@@ -142,19 +145,18 @@ class SunnyBeam:
             self._dev.manufacturer,
             self._dev.serial_number,
         )
-        util.claim_interface(self._dev, 0)
-
-        response = self._dev.ctrl_transfer(
-            bmRequestType=0x40, bRequest=0x03, wIndex=0x0000, wValue=0x4138
-        )
-        if response != 0:
-            raise ConnectionError("Could not set required features to device")
+        await loop.run_in_executor(None, lambda: util.claim_interface(self._dev, 0))
 
         # First do a SET_FEATURE config
         try:
-            response = self._dev.ctrl_transfer(
-                bmRequestType=0x40, bRequest=0x03, wIndex=0x0000, wValue=0x4138
+            response = await loop.run_in_executor(
+                None,
+                lambda: self._dev.ctrl_transfer(
+                    bmRequestType=0x40, bRequest=0x03, wIndex=0x0000, wValue=0x4138
+                ),
             )
+            if response != 0:
+                raise ConnectionError("Could not set required features to device")
         except core.USBError as err:
             raise ConnectionError("Could not set required features to device") from err
 
@@ -166,6 +168,7 @@ class SunnyBeam:
                 + hex(self._device_id[1]).lstrip("0x")
                 + hex(self._device_id[0]).lstrip("0x")
             )
+        await asyncio.sleep(0.7)
         self._connected = True
 
     async def _do_combined_read_messages(self, input_msg: bytearray) -> bytearray:
