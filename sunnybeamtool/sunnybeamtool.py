@@ -272,7 +272,10 @@ class SunnyBeam:
         await asyncio.sleep(0.2)
 
         try:
-            nr_sent_bytes = self._dev.write(endpoint=0x02, data=msg, timeout=1000)
+            loop = asyncio.get_event_loop()
+            nr_sent_bytes = await loop.run_in_executor(
+                None, lambda: self._dev.write(endpoint=0x02, data=msg, timeout=1000)
+            )
         except core.USBError as err:
             raise ConnectionError("Device not available") from err
         if nr_sent_bytes <= 0:
@@ -302,7 +305,13 @@ class SunnyBeam:
         for _ in range(max_iterations):
             await asyncio.sleep(0.07)
             try:
-                raw_response = self._dev.read(0x81, buffer_size, 1000)
+                loop = asyncio.get_event_loop()
+                raw_response = await loop.run_in_executor(
+                    None,
+                    lambda: self._dev.read(
+                        endpoint=0x81, size_or_buffer=buffer_size, timeout=1000
+                    ),
+                )
             except core.USBError as err:
                 raise ConnectionError("Could not read form device") from err
             buf_in = bytearray(raw_response.tobytes())
