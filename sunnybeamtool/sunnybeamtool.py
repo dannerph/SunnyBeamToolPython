@@ -67,6 +67,7 @@ class SunnyBeam:
         """
         await self._connect()
         try:
+            await self._do_syn_online()
             await self._send_raw_message(GET_MEASUREMENTS_CMD, True)
 
             buf = await self._read_raw_message(50)
@@ -174,6 +175,7 @@ class SunnyBeam:
     async def _do_combined_read_messages(self, input_msg: bytearray) -> bytearray:
 
         # first message
+        await self._do_syn_online()
         await self._send_raw_message(input_msg, True)
 
         buf_out = bytearray()
@@ -241,8 +243,6 @@ class SunnyBeam:
         Returns:
             int: Number of bytes written
         """
-        await self._do_syn_online()
-
         if set_device_id:
             msg[7:9] = self._device_id
 
