@@ -172,7 +172,6 @@ class SunnyBeam:
         self._connected = True
 
     async def _do_combined_read_messages(self, input_msg: bytearray) -> bytearray:
-        await self._do_syn_online()
 
         # first message
         await self._send_raw_message(input_msg, True)
@@ -242,6 +241,8 @@ class SunnyBeam:
         Returns:
             int: Number of bytes written
         """
+        await self._do_syn_online()
+
         if set_device_id:
             msg[7:9] = self._device_id
 
